@@ -19,29 +19,36 @@ def frac_diff(series, d, threshold=1e-4):
     res = []
     for i in range(len(weights) - 1, len(series)):
         window = series.iloc[i - len(weights) + 1 : i + 1]
-        res.append(np.dot(weights.T, window)[0])
+        res.append(np.dot(weights.flatten(), window))
     return pd.Series(res, index=series.index[len(weights) - 1:])
+
+def find_optimal_d(series):
+    # Cherche le plus petit d qui rend la série stationnaire
+    for d in np.arange(0.1, 1.05, 0.05):
+        diff_series = frac_diff(series, d=d).dropna()
+        if len(diff_series) > 100:
+            p_val = adfuller(diff_series)[1]
+            if p_val < 0.05:
+                return d, diff_series
+    # Différenciation classique (rendements) en dernier recours
+    return 1.0, series.diff().dropna() 
 
 def get_data():
     start_date = '2015-01-01'
     end_date = '2026-05-01'
     
-    tickers = ['IVW', 'IVE', 'MTUM', '^VIX']
-    df_market = yf.download(tickers, start=start_date, end=end_date)['Adj Close']
+    tickers = ['IVW', 'IVE', 'MTUM', '^VIX', '^TNX', 'TIP']
+    df = yf.download(tickers, start=start_date, end=end_date)['Close']
     
-    # Variables macro (FRED en accès direct via CSV)
-    df_dgs10 = pd.read_csv('https://fred.stlouisfed.org/graph/fredgraph.csv?id=DGS10', index_col='DATE', parse_dates=True, na_values='.')
-    df_t10yie = pd.read_csv('https://fred.stlouisfed.org/graph/fredgraph.csv?id=T10YIE', index_col='DATE', parse_dates=True, na_values='.')
-    df_macro = df_dgs10.join(df_t10yie).loc[start_date:end_date]
-    
-    df = df_market.join(df_macro, how='inner').dropna()
+    df = df.dropna()
     df_log = np.log(df)
     
-    df_frac = pd.DataFrame({col: frac_diff(df_log[col], d=0.4) for col in df.columns})
-    
-    print("P-values du test de Dickey-Fuller Augmenté :")
-    for col in df_frac.columns:
-        p_val = adfuller(df_frac[col].dropna())[1]
-        print(f"{col}: {p_val:.4f}")
+    print("\nRecherche du paramètre de différenciation optimal (d) par actif...")
+    df_frac_dict = {}
+    for col in df_log.columns:
+        opt_d, diff_series = find_optimal_d(df_log[col])
+        print(f"{col}: d = {opt_d:.2f}")
+        df_frac_dict[col] = diff_series
         
+    df_frac = pd.DataFrame(df_frac_dict).dropna()
     return df_frac

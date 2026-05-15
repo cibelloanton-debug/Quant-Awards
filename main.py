@@ -1,6 +1,6 @@
 from data_ingestion import get_data
 from preprocessing import align_and_clean
-from causal import discover_causality
+from causal_discovery import discover_causality
 
 if __name__ == "__main__":
     print("Début de l'extraction des données...")
