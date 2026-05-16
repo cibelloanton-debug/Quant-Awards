@@ -1,129 +1,125 @@
 import pandas as pd
 import numpy as np
-from sklearn.linear_model import HuberRegressor
-from sklearn.preprocessing import RobustScaler
-from sklearn.pipeline import make_pipeline
-from sklearn.model_selection import TimeSeriesSplit
 import yfinance as yf
+from stable_baselines3 import PPO
+from stable_baselines3.common.vec_env import DummyVecEnv
 from data_ingestion import get_data
+from trading_env import TradingEnv
 import warnings
 
 warnings.filterwarnings("ignore")
 
-def prepare_pure_continuous_features():
-    print("Ingestion : Modélisation 100% Continue (Z-Scores & Ratios)...")
-    
+# --- 1. FONCTIONS DE DIFFÉRENCIATION (PHASE 2) ---
+def get_weights_ffd(d, size):
+    w = [1.]
+    for k in range(1, size):
+        w_ = -w[-1] * (d - k + 1) / k
+        w.append(w_)
+    return np.array(w[::-1])
+
+def frac_diff_ffd(series, d, window=100):
+    weights = get_weights_ffd(d, window)
+    def apply_weights(x):
+        return np.dot(x, weights)
+    return series.rolling(window).apply(apply_weights, raw=True)
+
+def prepare_rl_environment_data():
     X_frac = get_data()
     raw_prices = yf.download(['MTUM', '^TNX', 'IVW', '^VIX'], start='2015-01-01', end='2026-05-01')['Close']
     raw_prices = raw_prices.dropna()
     
-    # Cible 100% continue : Rendement réel futur à 5 jours
-    y_continuous = raw_prices['MTUM'].shift(-5) / raw_prices['MTUM'] - 1
-    
     common_index = X_frac.index.intersection(raw_prices.index)
     X_frac = X_frac.loc[common_index]
     raw_prices = raw_prices.loc[common_index]
-    y_clean = y_continuous.loc[common_index]
     
     X = pd.DataFrame(index=common_index)
     
-    # Indicateurs continus fluides (aucune variable binaire)
-    X['Dist_MA200'] = raw_prices['MTUM'].shift(1) / raw_prices['MTUM'].shift(1).rolling(200).mean() - 1
-    X['Vol_Ratio'] = raw_prices['MTUM'].shift(1).pct_change().rolling(10).std() / raw_prices['MTUM'].shift(1).pct_change().rolling(60).std()
-    X['VIX_ZScore'] = (raw_prices['^VIX'].shift(1) - raw_prices['^VIX'].shift(1).rolling(60).mean()) / raw_prices['^VIX'].shift(1).rolling(60).std()
-    X['Corr_TNX_MTUM'] = raw_prices['^TNX'].shift(1).rolling(60).corr(raw_prices['MTUM'].shift(1))
+    X['MTUM_Frac_0.45'] = frac_diff_ffd(raw_prices['MTUM'], d=0.45, window=100)
+    X['MTUM_Ret'] = raw_prices['MTUM'].pct_change()
+    X['TNX_Ret'] = raw_prices['^TNX'].pct_change()
+    X['MTUM_Vol_20'] = raw_prices['MTUM'].pct_change().rolling(20).std() * np.sqrt(252)
+    X['VIX_Spike'] = raw_prices['^VIX'] / raw_prices['^VIX'].rolling(50).mean()
+    X['Cross_Asset_Momentum'] = raw_prices['MTUM'].pct_change(20) - raw_prices['IVW'].pct_change(20)
     
-    X['MTUM_Vol'] = raw_prices['MTUM'].shift(1).pct_change().rolling(20).std() * np.sqrt(252)
-    
-    X['Target'] = y_clean
     X = X.replace([np.inf, -np.inf], np.nan).dropna()
+    raw_prices = raw_prices.loc[X.index]
     
-    y_final = X.pop('Target')
-    return X, y_final, raw_prices
+    return X, raw_prices
 
-def backtest_continuous_strategy(raw_prices, signals_series, transaction_cost=0.001):
-    print(f"\nCalcul des métriques (Huber + Allocation Continue + Frais {transaction_cost*100}%)...")
-    daily_returns = raw_prices['MTUM'].pct_change().shift(-1)
-    risk_free_daily = (raw_prices['^TNX'] / 100 / 252).shift(-1)
+# --- 2. ÉVALUATION ET BACKTEST HORS ÉCHANTILLON ---
+def evaluate_agent(model, env_test, df_test, raw_prices_test):
+    print("\nÉvaluation de l'Agent sur des données inconnues (Out-of-Sample)...")
     
-    strat_returns = pd.Series(0.0, index=signals_series.index)
-    position_changes = signals_series.diff().abs().fillna(0)
+    obs, _ = env_test.reset()
+    terminated = False
+    truncated = False
     
-    for date in signals_series.index:
-        if date not in daily_returns.index or pd.isna(daily_returns.loc[date]):
-            continue
-            
-        weight = signals_series.loc[date]
-        friction = position_changes.loc[date] * transaction_cost
+    portfolio_history = [100.0]
+    market_history = [100.0]
+    
+    daily_returns = raw_prices_test['MTUM'].pct_change().dropna().values
+    
+    step_idx = 0
+    while not (terminated or truncated):
+        # L'agent décide de son levier de manière déterministe (sans exploration aléatoire)
+        action, _states = model.predict(obs, deterministic=True)
+        obs, reward, terminated, truncated, info = env_test.step(action)
         
-        if weight > 0:
-            borrowing_cost = risk_free_daily.loc[date] * max(0, weight - 1)
-            strat_returns.loc[date] = (daily_returns.loc[date] * weight) - borrowing_cost - friction
-        else:
-            strat_returns.loc[date] = risk_free_daily.loc[date] - friction
-            
-    market_returns = daily_returns.loc[strat_returns.index]
+        portfolio_history.append(info['portfolio_value'])
+        if step_idx < len(daily_returns):
+            market_history.append(market_history[-1] * (1 + daily_returns[step_idx]))
+        
+        step_idx += 1
+
+    port_series = pd.Series(portfolio_history)
+    market_series = pd.Series(market_history)
     
-    strat_equity = 100 * (1 + strat_returns.fillna(0)).cumprod()
-    bh_equity = 100 * (1 + market_returns.fillna(0)).cumprod()
+    # Calcul des métriques de survie
+    strat_returns = port_series.pct_change().dropna()
+    market_returns = market_series.pct_change().dropna()
     
     strat_std = strat_returns.std()
     strat_sharpe = np.sqrt(252) * strat_returns.mean() / strat_std if strat_std > 0 else 0
     bh_sharpe = np.sqrt(252) * market_returns.mean() / market_returns.std()
     
-    strat_dd = (strat_equity / strat_equity.cummax()) - 1.0
-    bh_dd = (bh_equity / bh_equity.cummax()) - 1.0
+    strat_dd = (port_series / port_series.cummax() - 1.0).min() * 100
+    bh_dd = (market_series / market_series.cummax() - 1.0).min() * 100
     
-    print("\nRÉSULTATS DU BACKTEST CONTINU ABSOLU")
+    print("\nRÉSULTATS DE L'AGENT DRL (NET DE FRAIS 0.1%)")
     print(f"Ratio de Sharpe Stratégie : {strat_sharpe:.2f} | (Marché : {bh_sharpe:.2f})")
-    print(f"Maximum Drawdown          : {strat_dd.min()*100:.1f}% | (Marché : {bh_dd.min()*100:.1f}%)")
-    print(f"Capital Final (Base 100)  : {strat_equity.iloc[-1]:.1f} | (Marché : {bh_equity.iloc[-1]:.1f})")
+    print(f"Maximum Drawdown          : {strat_dd:.1f}% | (Marché : {bh_dd:.1f}%)")
+    print(f"Capital Final (Base 100)  : {port_series.iloc[-1]:.1f} | (Marché : {market_series.iloc[-1]:.1f})")
 
-def run_continuous_quant_model():
-    X, y, raw_prices = prepare_pure_continuous_features()
+# --- 3. MOTEUR D'ENTRAÎNEMENT PPO ---
+def run_drl_model():
+    df_state, raw_prices = prepare_rl_environment_data()
     
-    print("\nExécution : Apprentissage Linéaire Robuste aux Krachs (Huber)...")
-    tscv = TimeSeriesSplit(n_splits=5, gap=5)
+    # Scission stricte (Train: 80% / Test: 20%) pour interdire la triche temporelle
+    split_idx = int(len(df_state) * 0.8)
+    df_train = df_state.iloc[:split_idx]
+    df_test = df_state.iloc[split_idx:]
+    prices_test = raw_prices.iloc[split_idx:]
     
-    # RobustScaler gère les valeurs extrêmes des features, Huber gère les extrêmes de la cible
-    model = make_pipeline(RobustScaler(), HuberRegressor(epsilon=1.35))
+    print(f"\nDonnées d'entraînement : {len(df_train)} jours.")
+    print(f"Données de test (Inconnues) : {len(df_test)} jours.")
     
-    raw_signals = pd.Series(0.0, index=X.index)
+    # Vectorisation de l'environnement d'entraînement
+    env_train_fn = lambda: TradingEnv(df_train, transaction_cost=0.001)
+    vec_env_train = DummyVecEnv([env_train_fn])
     
-    for train_index, test_index in tscv.split(X):
-        X_train, X_test = X.iloc[train_index].copy(), X.iloc[test_index].copy()
-        y_train = y.iloc[train_index]
-        
-        # Isolation de la volatilité pour ne pas l'utiliser comme feature prédictive directe
-        vol_test = X_test.pop('MTUM_Vol')
-        X_train.pop('MTUM_Vol')
-        
-        model.fit(X_train, y_train)
-        expected_returns = model.predict(X_test)
-        
-        for i, exp_ret in enumerate(expected_returns):
-            current_date = X_test.index[i]
-            current_vol = vol_test.iloc[i]
-            
-            # Allocation mathématique fluide : Plus le rendement espéré est grand face à la volatilité, plus on emprunte.
-            if current_vol > 0:
-                # Scaler empirique pour transposer la prédiction en levier
-                signal_strength = (exp_ret / current_vol) * 10
-                raw_signals.loc[current_date] = max(0.0, min(signal_strength, 2.0))
-            else:
-                raw_signals.loc[current_date] = 0.0
-                
-    # Filtre de friction pour préserver le capital
-    current_weight = 1.0
-    final_signals = pd.Series(1.0, index=X.index)
+    print("\nInitialisation du Réseau de Neurones Profond (PPO)...")
+    # Politique MlpPolicy : Architecture dense classique
+    model = PPO("MlpPolicy", vec_env_train, learning_rate=0.0003, n_steps=2048, batch_size=64, verbose=0, seed=42)
     
-    for idx in raw_signals.index:
-        target_weight = raw_signals.loc[idx]
-        if abs(target_weight - current_weight) >= 0.20:
-            current_weight = target_weight
-        final_signals.loc[idx] = current_weight
-
-    backtest_continuous_strategy(raw_prices, final_signals)
+    print("Entraînement en cours (100 000 itérations). La machine apprend la douleur de la friction...")
+    model.learn(total_timesteps=100000)
+    
+    print("Entraînement terminé. L'Agent est prêt.")
+    
+    # Environnement de test (Out-Of-Sample)
+    env_test = TradingEnv(df_test, transaction_cost=0.001)
+    evaluate_agent(model, env_test, df_test, prices_test)
+    model.save("ppo_quant_awards_model")
 
 if __name__ == "__main__":
-    run_continuous_quant_model()
+    run_drl_model()
